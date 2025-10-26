@@ -11,7 +11,7 @@ from pymongo import MongoClient
 load_dotenv()
 
 # Postgres schema helper
-PG_SCHEMA = os.getenv("PG_SCHEMA", "car_schema")   # CHANGE: to your car schema name
+PG_SCHEMA = os.getenv("PG_SCHEMA", "public")   # CHANGE: to your car schema name
 def qualify(sql: str) -> str:
     # Replace occurrences of {S}.<table> with <schema>.<table>
     return sql.replace("{S}.", f"{PG_SCHEMA}.")
@@ -20,162 +20,164 @@ def qualify(sql: str) -> str:
 CONFIG = {
     "postgres": {
         "enabled": True,
-        "uri": os.getenv("PG_URI", "postgresql+psycopg2://postgres:password@localhost:5432/connected_car"),  # Will read from your .env file
+        "uri": os.getenv("PG_URI", "postgresql+psycopg2://postgres:password@localhost:5432/Connected_Car_Platform"),  # Will read from your .env file
         "queries": {
             # User 1: FLEET MANAGER
-            "Fleet Manager: Average Speed per Vehicle": {
+            "Fleet Manager: Vehicle Overview": {
                 "sql": """
-                    SELECT vehicle_id, AVG(speed) as avg_speed 
-                    FROM {S}.sensor_readings 
-                    WHERE ts >= NOW() - INTERVAL '7 days'
-                    GROUP BY vehicle_id
-                    ORDER BY avg_speed DESC;
+                    SELECT vehicle_id, manufacturer, vehicle_model, engine_type, last_service_date
+                    FROM {S}.vehicle
+                    ORDER BY last_service_date ASC;
                 """,
-                "chart": {"type": "bar", "x": "vehicle_id", "y": "avg_speed"},
+                "chart": {"type": "table"},
                 "tags": ["fleet_manager"],
                 "params": []
             },
-            "Fleet Manager: Harsh Braking Events by Driver": {
+            "Fleet Manager: Driver Performance": {
                 "sql": """
-                    SELECT driver_id, COUNT(*) as event_count
-                    FROM {S}.behavior_events 
-                    WHERE event_type = 'harsh_braking' 
-                    AND ts >= NOW() - INTERVAL '30 days'
-                    GROUP BY driver_id
-                    ORDER BY event_count DESC;
+                    SELECT d.driver_id, d.name, COUNT(t.trip_id) as trip_count, COUNT(a.alert_id) as alert_count
+                    FROM {S}.driver d
+                    LEFT JOIN {S}.trip t ON d.driver_id = t.driver_id
+                    LEFT JOIN {S}.alert a ON d.driver_id = a.driver_id
+                    GROUP BY d.driver_id, d.name
+                    ORDER BY alert_count DESC;
                 """,
-                "chart": {"type": "bar", "x": "driver_id", "y": "event_count"},
+                "chart": {"type": "bar", "x": "name", "y": "alert_count"},
                 "tags": ["fleet_manager", "safety"],
                 "params": []
             },
-            "Fleet Manager: Vehicle Utilization (Hours Driven)": {
+            "Fleet Manager: Recent Trips": {
                 "sql": """
-                    SELECT vehicle_id, 
-                           SUM(CASE WHEN ignition_status = true THEN 1 ELSE 0 END) as total_hours,
-                           COUNT(DISTINCT DATE(ts)) as days_operated
-                    FROM {S}.sensor_readings 
-                    WHERE ts >= NOW() - INTERVAL '7 days'
-                    AND sensor_type = 'ignition'
-                    GROUP BY vehicle_id
-                    ORDER BY total_hours DESC;
+                    SELECT trip_id, vehicle_id, start_time, total_distance
+                    FROM {S}.trip
+                    ORDER BY start_time DESC
+                    LIMIT 10;
                 """,
-                "chart": {"type": "bar", "x": "vehicle_id", "y": "total_hours"},
+                "chart": {"type": "table"},
                 "tags": ["fleet_manager"],
                 "params": []
             },
-            "Fleet Manager: Speeding Incidents by Time of Day": {
+            "Fleet Manager: Vehicle Utilization": {
                 "sql": """
-                    SELECT EXTRACT(HOUR FROM ts) as hour_of_day, 
-                           COUNT(*) as incident_count
-                    FROM {S}.behavior_events 
-                    WHERE event_type = 'speeding'
-                    AND ts >= NOW() - INTERVAL '30 days'
-                    GROUP BY hour_of_day
-                    ORDER BY hour_of_day;
+                    SELECT v.vehicle_id, v.manufacturer, v.vehicle_model, 
+                           COUNT(t.trip_id) as trip_count, 
+                           COALESCE(SUM(t.total_distance), 0) as total_km
+                    FROM {S}.vehicle v
+                    LEFT JOIN {S}.trip t ON v.vehicle_id = t.vehicle_id
+                    GROUP BY v.vehicle_id, v.manufacturer, v.vehicle_model
+                    ORDER BY trip_count DESC;
                 """,
-                "chart": {"type": "line", "x": "hour_of_day", "y": "incident_count"},
-                "tags": ["fleet_manager", "safety"],
+                "chart": {"type": "bar", "x": "vehicle_id", "y": "total_km"},
+                "tags": ["fleet_manager"],
                 "params": []
             },
 
             # User 2: MAINTENANCE TECHNICIAN
-            "Maintenance: Vehicles with Engine Warnings": {
+            "Maintenance: Vehicles Due for Service": {
                 "sql": """
-                    SELECT vehicle_id, warning_code, severity, timestamp
-                    FROM {S}.diagnostic_alerts 
-                    WHERE severity >= 2
-                    AND timestamp >= NOW() - INTERVAL '48 hours'
-                    ORDER BY severity DESC, timestamp DESC;
+                    SELECT vehicle_id, manufacturer, vehicle_model, last_service_date
+                    FROM {S}.vehicle
+                    WHERE last_service_date < CURRENT_DATE - INTERVAL '2 months'
+                    ORDER BY last_service_date ASC;
                 """,
                 "chart": {"type": "table"},
                 "tags": ["maintenance"],
                 "params": []
             },
-            "Maintenance: Battery Voltage Trends": {
+            "Maintenance: Recent Maintenance Records": {
                 "sql": """
-                    SELECT vehicle_id,
-                           DATE_TRUNC('hour', ts) as hour,
-                           AVG(voltage) as avg_voltage,
-                           MIN(voltage) as min_voltage,
-                           MAX(voltage) as max_voltage
-                    FROM {S}.sensor_readings 
-                    WHERE sensor_type = 'battery'
-                    AND ts >= NOW() - INTERVAL '24 hours'
-                    GROUP BY vehicle_id, hour
-                    ORDER BY vehicle_id, hour;
-                """,
-                "chart": {"type": "line", "x": "hour", "y": "avg_voltage"},
-                "tags": ["maintenance"],
-                "params": ["vehicle_id"]
-            },
-            "Maintenance: Tire Pressure Anomalies": {
-                "sql": """
-                    SELECT vehicle_id, tire_position, pressure,
-                           CASE 
-                               WHEN pressure < 32 THEN 'Low'
-                               WHEN pressure > 38 THEN 'High'
-                               ELSE 'Normal'
-                           END as status
-                    FROM {S}.tire_readings 
-                    WHERE (pressure < 32 OR pressure > 38)
-                    AND ts >= NOW() - INTERVAL '2 hours'
-                    ORDER BY vehicle_id, tire_position;
+                    SELECT m.maintenance_id, v.manufacturer, v.vehicle_model, 
+                           m.maintenance_type, m.maintenance_date, m.maintenance_cost
+                    FROM {S}.maintenance m
+                    JOIN {S}.vehicle v ON m.vehicle_id = v.vehicle_id
+                    ORDER BY m.maintenance_date DESC;
                 """,
                 "chart": {"type": "table"},
+                "tags": ["maintenance"],
+                "params": []
+            },
+            "Maintenance: Active Alerts": {
+                "sql": """
+                    SELECT a.alert_id, v.vehicle_id, v.manufacturer, v.vehicle_model,
+                           a.alert_type, a.severity_level, a.alert_timestamp
+                    FROM {S}.alert a
+                    JOIN {S}.vehicle v ON a.vehicle_id = v.vehicle_id
+                    WHERE a.alert_timestamp >= NOW() - INTERVAL '48 hours'
+                    ORDER BY a.alert_timestamp DESC;
+                """,
+                "chart": {"type": "table"},
+                "tags": ["maintenance"],
+                "params": []
+            },
+            "Maintenance: Sensor Overview": {
+                "sql": """
+                    SELECT v.vehicle_id, v.manufacturer, v.vehicle_model, 
+                           s.sensor_type, COUNT(s.sensor_id) as sensor_count
+                    FROM {S}.vehicle v
+                    JOIN {S}.sensor s ON v.vehicle_id = s.vehicle_id
+                    GROUP BY v.vehicle_id, v.manufacturer, v.vehicle_model, s.sensor_type
+                    ORDER BY v.vehicle_id;
+                """,
+                "chart": {"type": "bar", "x": "vehicle_id", "y": "sensor_count"},
                 "tags": ["maintenance"],
                 "params": []
             },
 
             # User 3: SAFETY ANALYST
-            "Safety: Driver Behavior Scores": {
+            "Safety: Alert Statistics": {
                 "sql": """
-                    SELECT driver_id,
-                           SUM(CASE 
-                               WHEN event_type = 'speeding' THEN -2
-                               WHEN event_type = 'harsh_braking' THEN -3
-                               WHEN event_type = 'rapid_acceleration' THEN -2
-                               WHEN event_type = 'sharp_turning' THEN -2
-                               WHEN event_type = 'smooth_driving' THEN 1
-                               ELSE 0
-                           END) as behavior_score,
-                           COUNT(*) as total_events
-                    FROM {S}.behavior_events 
-                    WHERE ts >= NOW() - INTERVAL '7 days'
-                    GROUP BY driver_id
-                    ORDER BY behavior_score DESC;
+                    SELECT alert_type, severity_level, COUNT(*) as count,
+                           ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM {S}.alert), 2) as percentage
+                    FROM {S}.alert
+                    GROUP BY alert_type, severity_level
+                    ORDER BY count DESC;
                 """,
-                "chart": {"type": "bar", "x": "driver_id", "y": "behavior_score"},
-                "tags": ["safety"],
-                "params": []
-            },
-            "Safety: Event Distribution by Type": {
-                "sql": """
-                    SELECT event_type, COUNT(*) as event_count
-                    FROM {S}.behavior_events 
-                    WHERE ts >= NOW() - INTERVAL '30 days'
-                    GROUP BY event_type
-                    ORDER BY event_count DESC;
-                """,
-                "chart": {"type": "pie", "names": "event_type", "values": "event_count"},
+                "chart": {"type": "pie", "names": "alert_type", "values": "count"},
                 "tags": ["safety"],
                 "params": []
             },
             "Safety: High-Risk Drivers": {
                 "sql": """
-                    SELECT driver_id, 
-                           COUNT(CASE WHEN event_type = 'harsh_braking' THEN 1 END) as harsh_braking_count,
-                           COUNT(CASE WHEN event_type = 'speeding' THEN 1 END) as speeding_count,
-                           COUNT(*) as total_events
-                    FROM {S}.behavior_events 
-                    WHERE ts >= NOW() - INTERVAL '30 days'
-                    GROUP BY driver_id
-                    HAVING COUNT(CASE WHEN event_type = 'harsh_braking' THEN 1 END) > :risk_threshold
-                    OR COUNT(CASE WHEN event_type = 'speeding' THEN 1 END) > :risk_threshold
-                    ORDER BY total_events DESC;
+                    SELECT d.driver_id, d.name,
+                           COUNT(CASE WHEN a.severity_level = 'High' THEN 1 END) as high_alert_count,
+                           COUNT(a.alert_id) as total_alerts
+                    FROM {S}.driver d
+                    LEFT JOIN {S}.alert a ON d.driver_id = a.driver_id
+                    GROUP BY d.driver_id, d.name
+                    HAVING COUNT(CASE WHEN a.severity_level = 'High' THEN 1 END) > :risk_threshold
+                    OR COUNT(a.alert_id) > :risk_threshold * 2
+                    ORDER BY high_alert_count DESC;
+                """,
+                "chart": {"type": "bar", "x": "name", "y": "high_alert_count"},
+                "tags": ["safety"],
+                "params": ["risk_threshold"]
+            },
+            "Safety: Trip Distance Analysis": {
+                "sql": """
+                    SELECT COUNT(*) as total_trips, 
+                           SUM(total_distance) as total_distance, 
+                           ROUND(AVG(total_distance), 2) as avg_distance, 
+                           MAX(total_distance) as longest_trip
+                    FROM {S}.trip;
                 """,
                 "chart": {"type": "table"},
                 "tags": ["safety"],
-                "params": ["risk_threshold"]
+                "params": []
+            },
+            "Safety: Speed Analysis": {
+                "sql": """
+                    SELECT s.vehicle_id, v.manufacturer, v.vehicle_model,
+                           ROUND(AVG(s.sensor_value), 2) as avg_speed,
+                           MAX(s.sensor_value) as max_speed
+                    FROM {S}.sensor s
+                    JOIN {S}.vehicle v ON s.vehicle_id = v.vehicle_id
+                    WHERE s.sensor_type = 'speed transmitter'
+                    GROUP BY s.vehicle_id, v.manufacturer, v.vehicle_model
+                    ORDER BY avg_speed DESC;
+                """,
+                "chart": {"type": "bar", "x": "vehicle_id", "y": "avg_speed"},
+                "tags": ["safety"],
+                "params": []
             }
         }
     },
